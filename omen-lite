@@ -1,0 +1,312 @@
+#!/usr/bin/python3 -I
+"""omen-lite: power mode and fan control for the HP OMEN Transcend 14.
+
+  omen-lite                      open the window
+  omen-lite status               print current state
+  omen-lite mode cool|balanced|performance
+  omen-lite fan auto|max
+  omen-lite gpu on|off           turn the NVIDIA GPU off (iGPU only) or back on
+
+Power modes go through power-profiles-daemon (the same setting as the
+GNOME power menu); the omen-lite service keeps the HP firmware in step.
+Fan changes go through the root helper via pkexec.
+"""
+import glob
+import os
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib
+
+HELPER = "/usr/local/libexec/omen-lite-helper"
+PPD_BUS = "org.freedesktop.UPower.PowerProfiles"
+PPD_PATH = "/org/freedesktop/UPower/PowerProfiles"
+
+MODES = {"cool": "power-saver", "balanced": "balanced", "performance": "performance"}
+PPD_TO_MODE = {v: k for k, v in MODES.items()}
+FW_FOR = {"power-saver": "cool", "balanced": "balanced", "performance": "performance"}
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def first(pattern):
+    paths = sorted(glob.glob(pattern))
+    return paths[0] if paths else None
+
+
+def ppd_proxy():
+    return Gio.DBusProxy.new_for_bus_sync(
+        Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+        PPD_BUS, PPD_PATH, PPD_BUS, None)
+
+
+def ppd_get(proxy=None):
+    try:
+        v = (proxy or ppd_proxy()).get_cached_property("ActiveProfile")
+        return v.unpack() if v else None
+    except GLib.Error:
+        return None
+
+
+def ppd_set(ppd_mode):
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    bus.call_sync(PPD_BUS, PPD_PATH, "org.freedesktop.DBus.Properties", "Set",
+                  GLib.Variant("(ssv)", (PPD_BUS, "ActiveProfile", GLib.Variant("s", ppd_mode))),
+                  None, Gio.DBusCallFlags.NONE, 5000, None)
+
+
+def cpu_temp():
+    for label in glob.glob("/sys/class/hwmon/hwmon*/temp*_label"):
+        if read(label) == "Package id 0":
+            t = read(label.replace("_label", "_input"))
+            return int(t) / 1000 if t else None
+    return None
+
+
+NV_GPU = "/sys/bus/pci/devices/0000:01:00.0"
+
+
+def gpu_temp():
+    """NVIDIA GPU temperature, read only when the GPU is already awake.
+
+    Querying a sleeping GPU wakes it and costs battery, so in that case
+    we just report it as asleep.
+    """
+    if not os.path.exists(NV_GPU):
+        return "turned off"
+    if not glob.glob(NV_GPU + "/driver"):
+        return "no driver"
+    if read(NV_GPU + "/power/runtime_status") != "active":
+        return "asleep"
+    try:
+        # On a snap kernel nvidia-smi lives in the driver component, not on PATH.
+        smi = first("/snap/pc-kernel/components/mnt/nvidia-*-uda-user/*/usr/bin/nvidia-smi") or "nvidia-smi"
+        r = subprocess.run([smi, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=3)
+        return f"{int(r.stdout.split()[0])} °C"
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return "?"
+
+
+def gpu_name():
+    """'<model>, driver <version>' from driver files that don't wake the GPU."""
+    model = None
+    for line in (read(first("/proc/driver/nvidia/gpus/*/information") or "") or "").splitlines():
+        if line.startswith("Model:"):
+            model = line.split(":", 1)[1].strip().removeprefix("NVIDIA ").removeprefix("GeForce ")
+    ver = read("/sys/module/nvidia/version")
+    if not model:
+        return "NVIDIA GPU"
+    return f"{model}, driver {ver}" if ver else model
+
+
+def power_draw():
+    """Whole-laptop power draw in watts, only known on battery."""
+    w = read("/sys/class/power_supply/BAT0/power_now")
+    return int(w) / 1e6 if w and int(w) > 0 else None
+
+
+def status(proxy=None):
+    hw = first("/sys/devices/platform/hp-wmi/hwmon/hwmon*/")
+    ppd = ppd_get(proxy)
+    fw = read("/sys/firmware/acpi/platform_profile")
+    pwm = read(hw + "pwm1_enable") if hw else None
+    ac = any(read(p) == "1" for p in glob.glob("/sys/class/power_supply/*/online"))
+    draw = power_draw() if not ac else None
+    return {
+        "mode": PPD_TO_MODE.get(ppd, ppd),
+        "firmware": fw,
+        "in_sync": FW_FOR.get(ppd) == fw,
+        "cpu_pref": read("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"),
+        "fan_mode": {"0": "max", "2": "auto"}.get(pwm, pwm),
+        "fan1": read(hw + "fan1_input") if hw else None,
+        "fan2": read(hw + "fan2_input") if hw else None,
+        "cpu_temp": cpu_temp(),
+        "gpu_temp": gpu_temp(),
+        "gpu_name": gpu_name(),
+        "gpu_on": os.path.exists(NV_GPU),
+        "power": "AC" if ac else (f"battery, drawing {draw:.1f} W" if draw else "battery"),
+    }
+
+
+def run_helper(*args):
+    r = subprocess.run(["pkexec", HELPER, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "pkexec failed")
+
+
+def set_fan(mode):
+    run_helper("fan", mode)
+
+
+def set_gpu(mode):
+    run_helper("gpu", mode)
+
+
+# ---------------------------------------------------------------- CLI
+
+def cli(argv):
+    if argv[0] == "status":
+        s = status()
+        sync = "" if s["in_sync"] else "   (firmware out of step - is the omen-lite service running?)"
+        print(f"Power mode     {s['mode']}  [firmware: {s['firmware']}]{sync}")
+        print(f"CPU preference {s['cpu_pref']}")
+        print(f"Fans           {s['fan_mode']}  ({s['fan1']} / {s['fan2']} RPM)")
+        if s["cpu_temp"] is not None:
+            print(f"CPU temp       {s['cpu_temp']:.0f} °C")
+        print(f"NVIDIA GPU     {'on' if s['gpu_on'] else 'off (Intel graphics only)'}")
+        print(f"GPU temp       {s['gpu_temp']}  ({s['gpu_name']})")
+        print(f"Power source   {s['power']}")
+    elif argv[0] == "mode" and len(argv) == 2 and argv[1] in MODES:
+        ppd_set(MODES[argv[1]])
+    elif argv[0] == "fan" and len(argv) == 2 and argv[1] in ("auto", "max"):
+        set_fan(argv[1])
+    elif argv[0] == "gpu" and len(argv) == 2 and argv[1] in ("on", "off"):
+        try:
+            set_gpu(argv[1])
+        except RuntimeError as e:
+            print(e, file=sys.stderr)
+            return 1
+    else:
+        print(__doc__.strip())
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- GUI
+
+def gui():
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gtk
+
+    app = Adw.Application(application_id="local.omenlite")
+
+    def activate(app):
+        if app.get_active_window():
+            app.get_active_window().present()
+            return
+        proxy = ppd_proxy()
+        win = Adw.ApplicationWindow(application=app, title="OMEN Lite",
+                                    default_width=420, default_height=560)
+        toasts = Adw.ToastOverlay()
+        page = Adw.PreferencesPage()
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(Adw.HeaderBar())
+        toasts.set_child(view)
+        win.set_content(toasts)
+
+        # Power mode
+        mode_group = Adw.PreferencesGroup(title="Power mode")
+        box = Gtk.Box(spacing=0, homogeneous=True, css_classes=["linked"])
+        buttons = {}
+        for key, label in (("cool", "Cool"), ("balanced", "Balanced"), ("performance", "Performance")):
+            b = Gtk.ToggleButton(label=label)
+            if buttons:
+                b.set_group(next(iter(buttons.values())))
+            buttons[key] = b
+            box.append(b)
+        mode_group.add(box)
+        page.add(mode_group)
+
+        # Fans
+        fan_group = Adw.PreferencesGroup(title="Fans")
+        max_row = Adw.SwitchRow(title="Max fan speed",
+                                subtitle="Off = automatic (firmware fan curve)")
+        rpm_row = Adw.ActionRow(title="Fan speed")
+        fan_group.add(max_row)
+        fan_group.add(rpm_row)
+        page.add(fan_group)
+
+        # NVIDIA GPU
+        gpu_group = Adw.PreferencesGroup(title="Graphics")
+        gpu_row = Adw.SwitchRow(title="NVIDIA GPU",
+                                subtitle="Off = Intel graphics only; stops apps waking the GPU")
+        gpu_group.add(gpu_row)
+        page.add(gpu_group)
+
+        # Status
+        info = Adw.PreferencesGroup(title="Status")
+        rows = {}
+        for key, title in (("firmware", "Firmware profile"), ("cpu_pref", "CPU preference"),
+                           ("cpu_temp", "CPU temperature"), ("gpu_temp", "GPU temperature"),
+                           ("power", "Power source")):
+            rows[key] = Adw.ActionRow(title=title)
+            info.add(rows[key])
+        page.add(info)
+
+        updating = False
+
+        def refresh():
+            nonlocal updating
+            s = status(proxy)
+            updating = True
+            if s["mode"] in buttons:
+                buttons[s["mode"]].set_active(True)
+            max_row.set_active(s["fan_mode"] == "max")
+            gpu_row.set_active(s["gpu_on"])
+            updating = False
+            rpm_row.set_subtitle(f"{s['fan1']} / {s['fan2']} RPM")
+            fw = s["firmware"] or "?"
+            rows["firmware"].set_subtitle(fw if s["in_sync"] else f"{fw}  (out of step - service not running?)")
+            rows["cpu_pref"].set_subtitle(s["cpu_pref"] or "?")
+            rows["cpu_temp"].set_subtitle(f"{s['cpu_temp']:.0f} °C" if s["cpu_temp"] is not None else "?")
+            rows["gpu_temp"].set_title(f"GPU temperature ({s['gpu_name']})")
+            rows["gpu_temp"].set_subtitle(s["gpu_temp"])
+            rows["power"].set_subtitle(s["power"])
+            return True
+
+        def on_mode(button, key):
+            if updating or not button.get_active():
+                return
+            try:
+                ppd_set(MODES[key])
+            except GLib.Error as e:
+                toasts.add_toast(Adw.Toast(title=f"Could not change mode: {e.message}"))
+            GLib.timeout_add(400, lambda: refresh() and False)
+
+        def on_fan(row, _param):
+            if updating:
+                return
+            try:
+                set_fan("max" if row.get_active() else "auto")
+            except RuntimeError as e:
+                toasts.add_toast(Adw.Toast(title=f"Fan change failed: {e}"))
+            refresh()
+
+        def on_gpu(row, _param):
+            if updating:
+                return
+            try:
+                set_gpu("on" if row.get_active() else "off")
+            except RuntimeError as e:
+                toasts.add_toast(Adw.Toast(title=f"GPU change failed: {e}", timeout=6))
+            # rescan takes a moment before the device reappears
+            GLib.timeout_add(1500, lambda: refresh() and False)
+            refresh()
+
+        gpu_row.connect("notify::active", on_gpu)
+
+        for key, b in buttons.items():
+            b.connect("toggled", on_mode, key)
+        max_row.connect("notify::active", on_fan)
+        proxy.connect("g-properties-changed", lambda *a: refresh())
+
+        refresh()
+        GLib.timeout_add_seconds(2, refresh)
+        win.present()
+
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv[1:]) if len(sys.argv) > 1 else gui())

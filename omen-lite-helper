@@ -1,0 +1,231 @@
+#!/usr/bin/python3 -I
+"""omen-lite root helper.
+
+Runs as root, either through pkexec (one-shot commands from the app) or as
+the omen-lite systemd service (`daemon`). It only accepts a fixed set of
+commands and only writes to the hp-wmi sysfs files below.
+
+Why the daemon exists: power-profiles-daemon (the GNOME power mode menu)
+sets the CPU to power-saving in "Power Saver", but never moves the HP
+firmware to its "cool" profile, so the fans and power limits stay on
+"balanced". The daemon watches the active power mode and keeps the firmware
+in step. It also re-applies the chosen fan mode after boot and resume.
+"""
+import glob
+import json
+import os
+import sys
+import time
+
+PROFILE = "/sys/firmware/acpi/platform_profile"
+CHOICES = "/sys/firmware/acpi/platform_profile_choices"
+STATE_DIR = "/var/lib/omen-lite"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+# power-profiles-daemon mode -> HP firmware profile
+PPD_TO_FW = {"power-saver": "cool", "balanced": "balanced", "performance": "performance"}
+# hp-wmi pwm1_enable values
+FAN_TO_PWM = {"max": "0", "auto": "2"}
+PWM_TO_FAN = {v: k for k, v in FAN_TO_PWM.items()}
+
+PPD_BUS = "org.freedesktop.UPower.PowerProfiles"
+PPD_PATH = "/org/freedesktop/UPower/PowerProfiles"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def write(path, value):
+    with open(path, "w") as f:
+        f.write(value)
+
+
+def pwm_path():
+    paths = glob.glob("/sys/devices/platform/hp-wmi/hwmon/hwmon*/pwm1_enable")
+    return paths[0] if paths else None
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    if state.get("fan") not in FAN_TO_PWM:
+        state["fan"] = "auto"
+    if state.get("gpu") not in ("on", "off"):
+        state["gpu"] = "on"
+    return state
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
+def set_firmware(profile):
+    choices = (read(CHOICES) or "").split()
+    if profile not in choices:
+        raise SystemExit(f"firmware profile '{profile}' not supported (have: {' '.join(choices)})")
+    if read(PROFILE) != profile:
+        write(PROFILE, profile)
+
+
+def set_fan(mode, persist=True):
+    path = pwm_path()
+    if not path:
+        raise SystemExit("hp-wmi fan control not found")
+    if read(path) != FAN_TO_PWM[mode]:
+        write(path, FAN_TO_PWM[mode])
+    if persist:
+        state = load_state()
+        state["fan"] = mode
+        save_state(state)
+
+
+# ---------------------------------------------------------------- NVIDIA GPU
+# "Off" detaches the dGPU from the PCI bus. Measured on this laptop: idle draw
+# stays the same (its root port stays in D3cold), but nothing can wake the GPU
+# any more. "On" rescans the bus and the nvidia driver picks it up again.
+
+NV_GPU = "/sys/bus/pci/devices/0000:01:00.0"
+
+
+def gpu_users():
+    """Names of processes that have an NVIDIA device open."""
+    users = set()
+    for fd in glob.glob("/proc/[0-9]*/fd/*"):
+        try:
+            if os.readlink(fd).startswith("/dev/nvidia"):
+                users.add(read(fd.split("/fd/")[0] + "/comm") or "?")
+        except OSError:
+            pass
+    return sorted(users)
+
+
+def gpu_off():
+    """Detach the GPU. Returns an error message, or None on success/no-op."""
+    if not os.path.exists(NV_GPU):
+        return None
+    if read(NV_GPU + "/vendor") != "0x10de":
+        return "device 01:00.0 is not an NVIDIA GPU"
+    users = gpu_users()
+    if users:
+        return "GPU in use by: " + ", ".join(users)
+    write(NV_GPU + "/remove", "1")
+    return None
+
+
+def set_gpu(mode):
+    if mode == "off":
+        err = gpu_off()
+        if err:
+            raise SystemExit(err)
+    elif not os.path.exists(NV_GPU):
+        write("/sys/bus/pci/rescan", "1")
+    state = load_state()
+    state["gpu"] = mode
+    save_state(state)
+
+
+# ---------------------------------------------------------------- daemon
+
+def daemon():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    proxy = None
+    last_ppd = None
+    gpu_warned = False
+
+    def ppd_mode():
+        nonlocal proxy
+        try:
+            if proxy is None:
+                proxy = Gio.DBusProxy.new_for_bus_sync(
+                    Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None,
+                    PPD_BUS, PPD_PATH, PPD_BUS, None)
+                proxy.connect("g-properties-changed", lambda *a: sync())
+            v = proxy.get_cached_property("ActiveProfile")
+            return v.unpack() if v is not None else None
+        except GLib.Error:
+            proxy = None
+            return None
+
+    def sync():
+        nonlocal last_ppd, gpu_warned
+        mode = ppd_mode()
+        want_fw = PPD_TO_FW.get(mode)
+        have_fw = read(PROFILE)
+        if want_fw and have_fw != want_fw:
+            try:
+                set_firmware(want_fw)
+                log(f"power mode {mode}: firmware {have_fw} -> {want_fw}")
+            except (OSError, SystemExit) as e:
+                log(f"could not set firmware to {want_fw}: {e}")
+        elif mode != last_ppd:
+            log(f"power mode {mode}: firmware {have_fw}")
+        last_ppd = mode
+
+        state = load_state()
+        if state["gpu"] == "off" and os.path.exists(NV_GPU):
+            err = gpu_off()
+            if err:
+                if not gpu_warned:
+                    log(f"NVIDIA GPU should be off, waiting: {err}")
+                    gpu_warned = True
+            else:
+                log("NVIDIA GPU turned off")
+                gpu_warned = False
+
+        want_fan = state["fan"]
+        path = pwm_path()
+        if path and read(path) != FAN_TO_PWM[want_fan]:
+            try:
+                set_fan(want_fan, persist=False)
+                log(f"fan mode re-applied: {want_fan}")
+            except (OSError, SystemExit) as e:
+                log(f"could not set fan to {want_fan}: {e}")
+        return True  # keep the GLib timeout running
+
+    log("omen-lite daemon started")
+    sync()
+    # D-Bus signals cover mode changes; the timer catches firmware resets
+    # (resume from suspend, AC plug events) that send no signal.
+    GLib.timeout_add_seconds(3, sync)
+    GLib.MainLoop().run()
+
+
+USAGE = "usage: omen-lite-helper fan auto|max | gpu on|off | firmware cool|balanced|performance | daemon"
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        raise SystemExit("must run as root (use pkexec)")
+    if len(argv) == 3 and argv[1] == "fan" and argv[2] in FAN_TO_PWM:
+        set_fan(argv[2])
+    elif len(argv) == 3 and argv[1] == "gpu" and argv[2] in ("on", "off"):
+        set_gpu(argv[2])
+    elif len(argv) == 3 and argv[1] == "firmware" and argv[2] in PPD_TO_FW.values():
+        set_firmware(argv[2])
+    elif len(argv) == 2 and argv[1] == "daemon":
+        daemon()
+    else:
+        raise SystemExit(USAGE)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -1,0 +1,12 @@
+[Unit]
+Description=OMEN Lite - keep HP firmware profile in step with the power mode
+After=power-profiles-daemon.service
+Wants=power-profiles-daemon.service
+
+[Service]
+ExecStart=/usr/local/libexec/omen-lite-helper daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
