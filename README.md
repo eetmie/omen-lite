@@ -1,5 +1,15 @@
 # OMEN Lite
 
+````
+**NOTE:** I do NOT recommend raw-dogging these scripts as-is. They're heavily vibe-coded.
+They work for me, and the machine is in active use, but YMMV.
+
+I take no responsibility for your borked machine. Rather use as a baseline and do your own thing.
+````
+
+---
+
+
 Unlocks the full **75 W** GPU power budget on the HP OMEN Transcend 14-fb1xxx (board **8E41**,
 RTX 5070 Laptop) under Ubuntu. On Linux the stock `hp-wmi` driver gets 60 W in Balanced and only
 65 W in Performance.
