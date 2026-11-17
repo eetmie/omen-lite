@@ -1,11 +1,11 @@
 # OMEN Lite
 
-````
-**NOTE:** I do NOT recommend raw-dogging these scripts as-is. They're heavily vibe-coded.
-They work for me, and the machine is in active use, but YMMV.
-
-I take no responsibility for your borked machine. Rather use as a baseline and do your own thing.
-````
+> [!WARNING]
+> I do **NOT** recommend raw-dogging these scripts as-is. They're heavily vibe-coded.
+> They work for me, and the machine is in active use, but YMMV.
+>
+> I take no responsibility for your borked machine.
+> Rather, use these scripts as a baseline and do your own thing.
 
 ---
 
