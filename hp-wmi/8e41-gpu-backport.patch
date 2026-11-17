@@ -1,0 +1,133 @@
+--- hp-wmi.stock.c	2026-11-16 00:20:34.988704289 +0200
++++ hp-wmi.c	2026-11-17 00:05:40.412067598 +0200
+@@ -39,6 +39,19 @@
+ MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
+ MODULE_DESCRIPTION("HP laptop WMI driver");
+ MODULE_LICENSE("GPL");
++MODULE_VERSION("8e41-gpu-4");
++
++/* Opt-in backport: keep the generic OMEN profile and fan interfaces intact. */
++static bool omen_8e41_gpu_boost;
++module_param(omen_8e41_gpu_boost, bool, 0644);
++MODULE_PARM_DESC(omen_8e41_gpu_boost,
++		"Apply cTGP/PPAB GPU modes on OMEN board 8E41 (experimental)");
++
++/* The firmware forwards this to the EC as NVIDIA D-notifier level 0xD0 | n. */
++static unsigned int omen_8e41_saver_dstate = 1;
++module_param(omen_8e41_saver_dstate, uint, 0644);
++MODULE_PARM_DESC(omen_8e41_saver_dstate,
++		"GPU throttle level 1-5 in the low-power profile on 8E41 (1 = none)");
+ 
+ MODULE_ALIAS("wmi:95F24279-4D7B-4334-9387-ACCDC67EF61C");
+ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
+@@ -1097,6 +1110,28 @@
+ 	return err;
+ }
+ 
++/* Read-only diagnostics; never change GPU modes from a sysfs read. */
++static ssize_t omen_gpu_power_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct victus_gpu_power_modes modes;
++	int ret;
++
++	if (!dmi_match(DMI_BOARD_NAME, "8E41"))
++		return -ENODEV;
++
++	guard(mutex)(&active_platform_profile_lock);
++	ret = hp_wmi_perform_query(HPWMI_GET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
++				   &modes, sizeof(modes), sizeof(modes));
++	if (ret)
++		return ret < 0 ? ret : -EIO;
++
++	return sysfs_emit(buf, "ctgp=%u ppab=%u dstate=%u slowdown_temp=%u\n",
++			  modes.ctgp_enable, modes.ppab_enable, modes.dstate,
++			  modes.gpu_slowdown_temp);
++}
++static DEVICE_ATTR_RO(omen_gpu_power);
++
+ static DEVICE_ATTR_RO(display);
+ static DEVICE_ATTR_RO(hddtemp);
+ static DEVICE_ATTR_RW(als);
+@@ -1105,6 +1140,7 @@
+ static DEVICE_ATTR_RW(postcode);
+ 
+ static struct attribute *hp_wmi_attrs[] = {
++	&dev_attr_omen_gpu_power.attr,
+ 	&dev_attr_display.attr,
+ 	&dev_attr_hddtemp.attr,
+ 	&dev_attr_als.attr,
+@@ -1548,6 +1584,9 @@
+ 	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
+ }
+ 
++static int victus_s_gpu_thermal_profile_set(bool ctgp_enable,
++					    bool ppab_enable, u8 dstate);
++
+ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
+ {
+ 	int err, tp, tp_version;
+@@ -1571,6 +1610,7 @@
+ 		else
+ 			tp = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+ 		break;
++	case PLATFORM_PROFILE_LOW_POWER: /* 8E41 alias, see profile probe */
+ 	case PLATFORM_PROFILE_COOL:
+ 		if (tp_version == 0)
+ 			tp = HP_OMEN_V0_THERMAL_PROFILE_COOL;
+@@ -1581,6 +1621,30 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/*
++	 * 8E41 is in the generic OMEN list, which is selected before the
++	 * Victus-S path. Apply only the GPU part of that path here, rather
++	 * than changing this board's profile names or fan implementation.
++	 * The helper reads and preserves the firmware slowdown temperature.
++	 * This must precede the profile write: the firmware refreshes its boost
++	 * budgets (DSDT DTPC) on that write, and only while PPAB is enabled.
++	 */
++	if (omen_8e41_gpu_boost && dmi_match(DMI_BOARD_NAME, "8E41")) {
++		bool ctgp = profile == PLATFORM_PROFILE_PERFORMANCE;
++		bool ppab = profile != PLATFORM_PROFILE_COOL &&
++			    profile != PLATFORM_PROFILE_LOW_POWER;
++		u8 dstate = profile == PLATFORM_PROFILE_LOW_POWER ?
++			    clamp(omen_8e41_saver_dstate, 1U, 5U) : 1;
++
++		err = victus_s_gpu_thermal_profile_set(ctgp, ppab, dstate);
++		if (err) {
++			pr_warn("8E41 GPU power modes failed: %d\n", err);
++			return err < 0 ? err : -EIO;
++		}
++		pr_info("8E41 GPU power modes: cTGP=%u PPAB=%u dstate=%u\n",
++			ctgp, ppab, dstate);
++	}
++
+ 	err = omen_thermal_profile_set(tp);
+ 	if (err < 0)
+ 		return err;
+@@ -1798,9 +1862,9 @@
+ 					       &current_ppab_state,
+ 					       &current_dstate,
+ 					       &current_gpu_slowdown_temp);
+-	if (ret < 0) {
++	if (ret) {
+ 		pr_warn("GPU modes not updated, unable to get slowdown temp\n");
+-		return ret;
++		return ret < 0 ? ret : -EIO;
+ 	}
+ 
+ 	gpu_power_modes.ctgp_enable = ctgp_enable ? 0x01 : 0x00;
+@@ -1983,6 +2047,12 @@
+ {
+ 	if (is_omen_thermal_profile()) {
+ 		set_bit(PLATFORM_PROFILE_COOL, choices);
++		/*
++		 * power-profiles-daemon asks for low-power in Power Saver; without
++		 * it the daemon writes balanced and then adopts that as its mode.
++		 */
++		if (omen_8e41_gpu_boost && dmi_match(DMI_BOARD_NAME, "8E41"))
++			set_bit(PLATFORM_PROFILE_LOW_POWER, choices);
+ 	} else if (is_victus_thermal_profile()) {
+ 		set_bit(PLATFORM_PROFILE_QUIET, choices);
+ 	} else if (is_victus_s_thermal_profile()) {

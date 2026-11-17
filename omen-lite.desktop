@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=OMEN Lite
-Comment=Power mode and fan control
-Exec=/usr/local/bin/omen-lite
-Icon=power-profile-performance-symbolic
-Terminal=false
-Type=Application
-Categories=System;Settings;
