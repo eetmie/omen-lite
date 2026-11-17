@@ -5,7 +5,6 @@
   omen-lite status               print current state
   omen-lite mode cool|balanced|performance
   omen-lite fan auto|max
-  omen-lite gpu on|off           turn the NVIDIA GPU off (iGPU only) or back on
 
 Power modes go through power-profiles-daemon (the same setting as the
 GNOME power menu); the omen-lite service keeps the HP firmware in step.
@@ -15,6 +14,7 @@ import glob
 import os
 import subprocess
 import sys
+import time
 
 import gi
 gi.require_version("Gio", "2.0")
@@ -72,13 +72,17 @@ def cpu_temp():
 
 
 NV_GPU = "/sys/bus/pci/devices/0000:01:00.0"
+GPU_TEMP_EVERY = 30  # seconds
+_gpu_temp = [-GPU_TEMP_EVERY, "?"]  # [time read, value]
 
 
 def gpu_temp():
     """NVIDIA GPU temperature, read only when the GPU is already awake.
 
     Querying a sleeping GPU wakes it and costs battery, so in that case
-    we just report it as asleep.
+    we just report it as asleep. Each nvidia-smi run also keeps the GPU
+    awake for a few seconds, so it runs at most every GPU_TEMP_EVERY
+    seconds; polling faster would stop the GPU from ever going back to sleep.
     """
     if not os.path.exists(NV_GPU):
         return "turned off"
@@ -86,14 +90,18 @@ def gpu_temp():
         return "no driver"
     if read(NV_GPU + "/power/runtime_status") != "active":
         return "asleep"
+    if time.monotonic() - _gpu_temp[0] < GPU_TEMP_EVERY:
+        return _gpu_temp[1]
     try:
         # On a snap kernel nvidia-smi lives in the driver component, not on PATH.
         smi = first("/snap/pc-kernel/components/mnt/nvidia-*-uda-user/*/usr/bin/nvidia-smi") or "nvidia-smi"
         r = subprocess.run([smi, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=3)
-        return f"{int(r.stdout.split()[0])} °C"
+        value = f"{int(r.stdout.split()[0])} °C"
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-        return "?"
+        value = "?"
+    _gpu_temp[:] = [time.monotonic(), value]
+    return value
 
 
 def gpu_name():
@@ -114,6 +122,40 @@ def power_draw():
     return int(w) / 1e6 if w and int(w) > 0 else None
 
 
+def battery():
+    """Battery details as (title, value) rows, always in the same order."""
+    b = "/sys/class/power_supply/BAT0/"
+
+    def num(name):  # sysfs gives µWh / µW / µV
+        v = read(b + name)
+        return int(v) / 1e6 if v and v.isdigit() else None
+
+    now, full, design = num("energy_now"), num("energy_full"), num("energy_full_design")
+    watts, volts, vmin = num("power_now"), num("voltage_now"), num("voltage_min_design")
+    state = read(b + "status") or "?"
+    pct = read(b + "capacity")
+
+    hours, time_title = None, "Time left"
+    if watts and now and full:
+        if state == "Discharging":
+            hours = now / watts
+        elif state == "Charging":
+            hours, time_title = (full - now) / watts, "Time to full"
+
+    return [
+        ("Status", state),
+        ("Charge", f"{pct} %  ({now:.1f} of {full:.1f} Wh)" if now and full else f"{pct or '?'} %"),
+        ("Health", f"{full / design * 100:.1f} %  ({full:.1f} of {design:.1f} Wh design)"
+                   if full and design else "?"),
+        ("Charge cycles", read(b + "cycle_count") or "?"),
+        ("Power", f"{watts:.1f} W" if watts else "not reported"),
+        (time_title, f"{int(hours)} h {int(hours * 60) % 60:02d} min" if hours else "-"),
+        ("Voltage", f"{volts:.2f} V  (design minimum {vmin:.2f} V)" if volts and vmin else "?"),
+        ("Battery", " ".join(filter(None, (read(b + "manufacturer"), read(b + "model_name"),
+                                           read(b + "technology")))) or "?"),
+    ]
+
+
 def status(proxy=None):
     hw = first("/sys/devices/platform/hp-wmi/hwmon/hwmon*/")
     ppd = ppd_get(proxy)
@@ -132,23 +174,22 @@ def status(proxy=None):
         "cpu_temp": cpu_temp(),
         "gpu_temp": gpu_temp(),
         "gpu_name": gpu_name(),
-        "gpu_on": os.path.exists(NV_GPU),
         "power": "AC" if ac else (f"battery, drawing {draw:.1f} W" if draw else "battery"),
     }
 
 
 def run_helper(*args):
-    r = subprocess.run(["pkexec", HELPER, *args], capture_output=True, text=True)
+    # The window waits on this, so never let it hang forever.
+    try:
+        r = subprocess.run(["pkexec", HELPER, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(str(e))
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "pkexec failed")
 
 
 def set_fan(mode):
     run_helper("fan", mode)
-
-
-def set_gpu(mode):
-    run_helper("gpu", mode)
 
 
 # ---------------------------------------------------------------- CLI
@@ -162,16 +203,13 @@ def cli(argv):
         print(f"Fans           {s['fan_mode']}  ({s['fan1']} / {s['fan2']} RPM)")
         if s["cpu_temp"] is not None:
             print(f"CPU temp       {s['cpu_temp']:.0f} °C")
-        print(f"NVIDIA GPU     {'on' if s['gpu_on'] else 'off (Intel graphics only)'}")
         print(f"GPU temp       {s['gpu_temp']}  ({s['gpu_name']})")
         print(f"Power source   {s['power']}")
     elif argv[0] == "mode" and len(argv) == 2 and argv[1] in MODES:
         ppd_set(MODES[argv[1]])
     elif argv[0] == "fan" and len(argv) == 2 and argv[1] in ("auto", "max"):
-        set_fan(argv[1])
-    elif argv[0] == "gpu" and len(argv) == 2 and argv[1] in ("on", "off"):
         try:
-            set_gpu(argv[1])
+            set_fan(argv[1])
         except RuntimeError as e:
             print(e, file=sys.stderr)
             return 1
@@ -199,8 +237,13 @@ def gui():
                                     default_width=420, default_height=560)
         toasts = Adw.ToastOverlay()
         page = Adw.PreferencesPage()
-        view = Adw.ToolbarView(content=page)
-        view.add_top_bar(Adw.HeaderBar())
+        bat_page = Adw.PreferencesPage()
+        stack = Adw.ViewStack()
+        stack.add_titled_with_icon(page, "control", "Control", "power-profile-balanced-symbolic")
+        stack.add_titled_with_icon(bat_page, "battery", "Battery", "battery-good-symbolic")
+        view = Adw.ToolbarView(content=stack)
+        view.add_top_bar(Adw.HeaderBar(title_widget=Adw.ViewSwitcher(
+            stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE)))
         toasts.set_child(view)
         win.set_content(toasts)
 
@@ -226,13 +269,6 @@ def gui():
         fan_group.add(rpm_row)
         page.add(fan_group)
 
-        # NVIDIA GPU
-        gpu_group = Adw.PreferencesGroup(title="Graphics")
-        gpu_row = Adw.SwitchRow(title="NVIDIA GPU",
-                                subtitle="Off = Intel graphics only; stops apps waking the GPU")
-        gpu_group.add(gpu_row)
-        page.add(gpu_group)
-
         # Status
         info = Adw.PreferencesGroup(title="Status")
         rows = {}
@@ -243,6 +279,14 @@ def gui():
             info.add(rows[key])
         page.add(info)
 
+        # Battery tab
+        bat_group = Adw.PreferencesGroup(title="Battery",
+                                         description="Health and cycles are reported by the battery itself")
+        bat_rows = [Adw.ActionRow(css_classes=["property"]) for _ in battery()]
+        for r in bat_rows:
+            bat_group.add(r)
+        bat_page.add(bat_group)
+
         updating = False
 
         def refresh():
@@ -252,7 +296,6 @@ def gui():
             if s["mode"] in buttons:
                 buttons[s["mode"]].set_active(True)
             max_row.set_active(s["fan_mode"] == "max")
-            gpu_row.set_active(s["gpu_on"])
             updating = False
             rpm_row.set_subtitle(f"{s['fan1']} / {s['fan2']} RPM")
             fw = s["firmware"] or "?"
@@ -262,6 +305,9 @@ def gui():
             rows["gpu_temp"].set_title(f"GPU temperature ({s['gpu_name']})")
             rows["gpu_temp"].set_subtitle(s["gpu_temp"])
             rows["power"].set_subtitle(s["power"])
+            for r, (title, value) in zip(bat_rows, battery()):
+                r.set_title(title)
+                r.set_subtitle(value)
             return True
 
         def on_mode(button, key):
@@ -281,19 +327,6 @@ def gui():
             except RuntimeError as e:
                 toasts.add_toast(Adw.Toast(title=f"Fan change failed: {e}"))
             refresh()
-
-        def on_gpu(row, _param):
-            if updating:
-                return
-            try:
-                set_gpu("on" if row.get_active() else "off")
-            except RuntimeError as e:
-                toasts.add_toast(Adw.Toast(title=f"GPU change failed: {e}", timeout=6))
-            # rescan takes a moment before the device reappears
-            GLib.timeout_add(1500, lambda: refresh() and False)
-            refresh()
-
-        gpu_row.connect("notify::active", on_gpu)
 
         for key, b in buttons.items():
             b.connect("toggled", on_mode, key)

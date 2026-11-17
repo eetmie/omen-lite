@@ -12,6 +12,8 @@ It uses only the stock kernel `hp-wmi` driver and replaces no drivers.
 - **Fans:** automatic (firmware curve) or max speed. Custom fan curves aren't
   possible on this board through the firmware interface.
 - **Status:** fan RPM, CPU and GPU temperature (never wakes a sleeping GPU), power draw on battery.
+- **Battery tab:** charge, health (full vs design capacity), charge cycles, power draw,
+  time left / to full, voltage.
 
 ## Install / remove
     sudo ./install.sh

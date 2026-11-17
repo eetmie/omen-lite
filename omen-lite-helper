@@ -26,7 +26,6 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 PPD_TO_FW = {"power-saver": "cool", "balanced": "balanced", "performance": "performance"}
 # hp-wmi pwm1_enable values
 FAN_TO_PWM = {"max": "0", "auto": "2"}
-PWM_TO_FAN = {v: k for k, v in FAN_TO_PWM.items()}
 
 PPD_BUS = "org.freedesktop.UPower.PowerProfiles"
 PPD_PATH = "/org/freedesktop/UPower/PowerProfiles"
@@ -62,8 +61,6 @@ def load_state():
         state = {}
     if state.get("fan") not in FAN_TO_PWM:
         state["fan"] = "auto"
-    if state.get("gpu") not in ("on", "off"):
-        state["gpu"] = "on"
     return state
 
 
@@ -95,51 +92,6 @@ def set_fan(mode, persist=True):
         save_state(state)
 
 
-# ---------------------------------------------------------------- NVIDIA GPU
-# "Off" detaches the dGPU from the PCI bus. Measured on this laptop: idle draw
-# stays the same (its root port stays in D3cold), but nothing can wake the GPU
-# any more. "On" rescans the bus and the nvidia driver picks it up again.
-
-NV_GPU = "/sys/bus/pci/devices/0000:01:00.0"
-
-
-def gpu_users():
-    """Names of processes that have an NVIDIA device open."""
-    users = set()
-    for fd in glob.glob("/proc/[0-9]*/fd/*"):
-        try:
-            if os.readlink(fd).startswith("/dev/nvidia"):
-                users.add(read(fd.split("/fd/")[0] + "/comm") or "?")
-        except OSError:
-            pass
-    return sorted(users)
-
-
-def gpu_off():
-    """Detach the GPU. Returns an error message, or None on success/no-op."""
-    if not os.path.exists(NV_GPU):
-        return None
-    if read(NV_GPU + "/vendor") != "0x10de":
-        return "device 01:00.0 is not an NVIDIA GPU"
-    users = gpu_users()
-    if users:
-        return "GPU in use by: " + ", ".join(users)
-    write(NV_GPU + "/remove", "1")
-    return None
-
-
-def set_gpu(mode):
-    if mode == "off":
-        err = gpu_off()
-        if err:
-            raise SystemExit(err)
-    elif not os.path.exists(NV_GPU):
-        write("/sys/bus/pci/rescan", "1")
-    state = load_state()
-    state["gpu"] = mode
-    save_state(state)
-
-
 # ---------------------------------------------------------------- daemon
 
 def daemon():
@@ -149,7 +101,6 @@ def daemon():
 
     proxy = None
     last_ppd = None
-    gpu_warned = False
 
     def ppd_mode():
         nonlocal proxy
@@ -166,7 +117,16 @@ def daemon():
             return None
 
     def sync():
-        nonlocal last_ppd, gpu_warned
+        # An exception escaping a GLib timeout cancels it for good, while the
+        # process keeps running, so systemd would never restart it.
+        try:
+            sync_once()
+        except Exception as e:
+            log(f"sync failed: {e!r}")
+        return True  # keep the GLib timeout running
+
+    def sync_once():
+        nonlocal last_ppd
         mode = ppd_mode()
         want_fw = PPD_TO_FW.get(mode)
         have_fw = read(PROFILE)
@@ -180,18 +140,7 @@ def daemon():
             log(f"power mode {mode}: firmware {have_fw}")
         last_ppd = mode
 
-        state = load_state()
-        if state["gpu"] == "off" and os.path.exists(NV_GPU):
-            err = gpu_off()
-            if err:
-                if not gpu_warned:
-                    log(f"NVIDIA GPU should be off, waiting: {err}")
-                    gpu_warned = True
-            else:
-                log("NVIDIA GPU turned off")
-                gpu_warned = False
-
-        want_fan = state["fan"]
+        want_fan = load_state()["fan"]
         path = pwm_path()
         if path and read(path) != FAN_TO_PWM[want_fan]:
             try:
@@ -199,7 +148,6 @@ def daemon():
                 log(f"fan mode re-applied: {want_fan}")
             except (OSError, SystemExit) as e:
                 log(f"could not set fan to {want_fan}: {e}")
-        return True  # keep the GLib timeout running
 
     log("omen-lite daemon started")
     sync()
@@ -209,7 +157,7 @@ def daemon():
     GLib.MainLoop().run()
 
 
-USAGE = "usage: omen-lite-helper fan auto|max | gpu on|off | firmware cool|balanced|performance | daemon"
+USAGE = "usage: omen-lite-helper fan auto|max | firmware cool|balanced|performance | daemon"
 
 
 def main(argv):
@@ -217,8 +165,6 @@ def main(argv):
         raise SystemExit("must run as root (use pkexec)")
     if len(argv) == 3 and argv[1] == "fan" and argv[2] in FAN_TO_PWM:
         set_fan(argv[2])
-    elif len(argv) == 3 and argv[1] == "gpu" and argv[2] in ("on", "off"):
-        set_gpu(argv[2])
     elif len(argv) == 3 and argv[1] == "firmware" and argv[2] in PPD_TO_FW.values():
         set_firmware(argv[2])
     elif len(argv) == 2 and argv[1] == "daemon":

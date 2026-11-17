@@ -3,24 +3,33 @@
 ## Laptop
 HP OMEN Transcend 14-fb1xxx (board 8E41), Core Ultra 9 285H, RTX 5070 Laptop (Blackwell, 10de:2d18).
 
-## Why we're reinstalling
+## Why we reinstalled
 Ubuntu 26.04 with TPM disk encryption uses a **snap kernel** (`pc-kernel`). Its NVIDIA
 add-ons only ship the closed kernel module, and RTX 50 cards need the **open** module
 (`RmInitAdapter failed ... requires use of the NVIDIA open kernel modules`).
 Canonical (Oct 20, 2026): Blackwell on snap kernels "should be implemented in the next
 few months". See canonical/ubuntu-core-docs#417.
 
-Plan: reinstall 26.04 with **LUKS passphrase** encryption (not TPM), normal apt kernel.
+Fix: reinstalled 26.04 with **LUKS passphrase** encryption (not TPM), normal apt kernel.
 
-## After the reinstall
-1. `sudo apt install nvidia-driver-595-open` (or newest `-open`). Secure Boot stays on:
-   set a MOK password when asked, enroll it on the blue screen at the next boot.
-2. Clone this repo, `sudo ./install.sh`, check `omen-lite status`.
-3. Check: `nvidia-smi` works; GPU sleeps at idle
-   (`/sys/bus/pci/devices/0000:01:00.0/power/runtime_status` = suspended); idle draw ~6–7 W on battery.
-4. Re-test `omen-lite gpu off` / `on` with the working driver, including the refusal
-   while an app uses the GPU (couldn't test that on the broken driver).
-5. Check GPU temperature shows in the window while the GPU is busy.
+## Reinstall results (2026-11-07)
+Kernel 7.0.0-43-generic (apt), `nvidia-driver-615-open` 615.71.09 + 
+`linux-modules-nvidia-615-open-generic-hwe-26.04`. Secure Boot on, MOK enrolled, module loads.
+
+1. [x] Driver installed (went with 615-open, not 595). Old 595 modules package is left in
+   `rc` state; harmless, purge with `sudo apt purge linux-modules-nvidia-595-open-7.0.0-43-generic`.
+2. [x] `install.sh` run; installed files match the repo; `omen-lite.service` running and
+   syncing firmware profile (cool/balanced) with the power mode.
+3. [x] `nvidia-smi` works (RTX 5070 Laptop, CUDA 13.4). GPU reaches `suspended` at idle
+   (runtime D3 fine-grained). Idle draw on battery 5.9–6.4 W. Note: running `nvidia-smi`
+   wakes the GPU for a few seconds (~12 W), so wait before measuring.
+4. [x] GPU off/on toggle removed (2026-11-10): every GTK app holds /dev/nvidia, so it
+   never worked in a session and its retry loop cost CPU.
+5. [x] GPU temperature shows in `omen-lite status` (52 °C, driver 615.71.09). Still worth
+   a look in the window while the GPU is busy.
+
+Also set black wallpaper/lock screen and a black Ptyxis palette
+(`~/.local/share/org.gnome.Ptyxis/palettes/Ubuntu Black.palette`) to save power on the OLED.
 
 ## Measurements (snap-kernel install, 16-thread busy loop, 60 s)
 Idle on battery: 6.6 W (dGPU in D3cold).
